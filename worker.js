@@ -3,6 +3,13 @@ importScripts('./openpgp.min.js');
 self.onmessage = async function handleMessageFromMain(msg) {
 
     try {
+        // Fingerprint lookup requested by the main thread (WebMCP tool).
+        if (msg.data && msg.data.getFingerprint) {
+            const key = await openpgp.readKey({ armoredKey: msg.data.armoredKey });
+            postMessage({ fingerprint: key.getFingerprint() });
+            return;
+        }
+
         const { privateKey, publicKey, revocationCertificate } = await openpgp.generateKey({
             type: msg.data.optionsTypeValue, // Type of the key, defaults to ECC
             curve: 'curve25519', // ECC curve name, defaults to curve25519
