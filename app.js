@@ -30,12 +30,28 @@ const clearError = () => {
     errorMessage.textContent = "";
 };
 
+const getTextareaByName = (textareaName) => {
+    // Whitelist the known textareas instead of building a selector from
+    // untrusted data attributes (defense in depth against selector injection).
+    const map = {
+        "private-key-textarea": privateKeyTextarea,
+        "public-key-textarea": publicKeyTextarea,
+        "revocation-certificate-textarea": revocationCertificateTextarea
+    };
+    return map[textareaName] || null;
+};
+
 const downloadFile = (element) => {
 
     const textareaName = element.dataset.target;
 
     const link = document.createElement("a");
-    const content = document.querySelector("#" + textareaName).value;
+    const target = getTextareaByName(textareaName);
+    if (!target) {
+        showError("Unknown download target.");
+        return;
+    }
+    const content = target.value;
     const file = new Blob([content], { type: 'text/plain' });
     link.href = URL.createObjectURL(file);
     link.download = textareaName.replace("-textarea", "") + ".asc";
@@ -47,7 +63,11 @@ const copyToClipboard = (element) => {
 
     const textareaName = element.dataset.target;
 
-    const textarea = document.querySelector("#" + textareaName);
+    const textarea = getTextareaByName(textareaName);
+    if (!textarea) {
+        showError("Unknown copy target.");
+        return;
+    }
 
     navigator.clipboard.writeText(textarea.value).then(() => {
         const originalText = element.innerText;
@@ -79,9 +99,13 @@ worker.onerror = (error) => {
     buttonGenerateKeys.innerText = "Generate Keys";
 };
 
-// Pending resolver for MCP tool calls that need to await key generation
+// Pending resolver for MCP tool calls that need to await key generation.
+// Guarded so concurrent/overlapping calls can never hand the wrong result
+// (or a manually generated key) to an agent.
 let _mcpPendingResolve = null;
 let _mcpPendingReject = null;
+let _mcpGenerationActive = false;
+let _mcpQueue = Promise.resolve();
 
 worker.onmessage = async function handleMessageFromMain(msg) {
 
@@ -90,6 +114,7 @@ worker.onmessage = async function handleMessageFromMain(msg) {
             const reject = _mcpPendingReject;
             _mcpPendingResolve = null;
             _mcpPendingReject = null;
+            _mcpGenerationActive = false;
             reject(new Error(msg.data.error));
         } else {
             showError("Error generating keys: " + msg.data.error);
@@ -97,6 +122,11 @@ worker.onmessage = async function handleMessageFromMain(msg) {
         buttonGenerateKeys.disabled = false;
         buttonGenerateKeys.innerText = "Generate Keys";
         return;
+    }
+
+    // Reply to fingerprint lookups requested by the WebMCP tool handler.
+    if (msg.data.fingerprint !== undefined) {
+        return; // handled by its own one-shot listener in app.js
     }
 
     privateKeyTextarea.value = msg.data.privateKey;
@@ -126,16 +156,29 @@ worker.onmessage = async function handleMessageFromMain(msg) {
     publicKeyTextarea.disabled = false;
     revocationCertificateTextarea.disabled = false;
 
-    // Resolve MCP tool call if one is pending
-    if (_mcpPendingResolve) {
+    // Resolve MCP tool call if one is pending (only while an MCP
+    // generation is actually active — manual clicks can't leak keys to agents)
+    if (_mcpGenerationActive && _mcpPendingResolve) {
         const resolve = _mcpPendingResolve;
         _mcpPendingResolve = null;
         _mcpPendingReject = null;
+        _mcpGenerationActive = false;
         resolve({
             privateKey: msg.data.privateKey,
             publicKey: msg.data.publicKey,
             revocationCertificate: msg.data.revocationCertificate
         });
+    }
+
+    // Wipe the passphrase from the DOM as soon as the protected key has
+    // been generated (it only lived in memory long enough for the worker).
+    // Defer by one tick so a fingerprint lookup queued right after
+    // generation can resolve first — otherwise this unrelated message would
+    // be mistaken for a key-generation result and clear the field early.
+    if (!_mcpGenerationActive && !_mcpPendingResolve) {
+        optionsPassphrase.value = "";
+    } else {
+        setTimeout(() => { optionsPassphrase.value = ""; }, 0);
     }
 };
 
@@ -201,10 +244,59 @@ optionsEmail.addEventListener("input", clearError);
 // ── WebMCP (Chrome Canary navigator.modelContext) ──────────────────────────
 // Registers a generate_pgp_keys tool so in-browser AI agents can call it.
 // Gracefully does nothing on browsers that don't support the API yet.
+//
+// SECURITY NOTES:
+//  - The tool NEVER returns private key material or the revocation
+//    certificate to the agent. Those stay in the page UI for the human user
+//    to copy/download. Returning them would let an AI agent (or a prompt
+//    injection against one) exfiltrate secrets or revoke keys.
+//  - Arguments are validated against whitelists before touching the form,
+//    and invalid values fall back to safe defaults instead of silently
+//    corrupting generation.
+//  - Calls are serialized through a queue so two concurrent tool calls can
+//    never cross-resolve each other's promises.
 if (typeof navigator !== 'undefined' && navigator.modelContext) {
+
+    const MCP_VALID_TYPES = ['ecc', 'rsa'];
+    const MCP_VALID_KEY_SIZES = ['2048', '4096'];
+    const MCP_VALID_EXPIRATIONS = ['0', '31536000', '63072000', '126144000', '252288000'];
+    const MCP_MAX_NAME_LEN = 200;
+    const MCP_MAX_EMAIL_LEN = 254;
+    const MCP_MAX_PASSPHRASE_LEN = 1024;
+
+    const runMcpGeneration = ({ name, email, type, keySize, passphrase, expirationTime }) =>
+        new Promise((resolve, reject) => {
+            if (_mcpGenerationActive) {
+                reject(new Error('Another key generation is already in progress. Please retry.'));
+                return;
+            }
+
+            // Populate the form fields so the UI reflects the generation
+            optionsName.value = name;
+            optionsEmail.value = email;
+            optionsType.value = type;
+            keyAlgorithmChanged(optionsType);
+            optionsKeySize.value = keySize;
+            optionsPassphrase.value = passphrase;
+            optionsExpirationTime.value = expirationTime;
+
+            _mcpPendingResolve = resolve;
+            _mcpPendingReject = reject;
+            _mcpGenerationActive = true;
+
+            try {
+                generateKeys();
+            } catch (err) {
+                _mcpPendingResolve = null;
+                _mcpPendingReject = null;
+                _mcpGenerationActive = false;
+                reject(err);
+            }
+        });
+
     navigator.modelContext.registerTool({
         name: 'generate_pgp_keys',
-        description: 'Generate a PGP key pair (private key, public key, and revocation certificate) using OpenPGP.js. All computation happens client-side in the browser.',
+        description: 'Generate a PGP key pair (private key, public key, and revocation certificate) using OpenPGP.js. All computation happens client-side in the browser. For security, the private key and revocation certificate are NOT returned to the caller — they are displayed on the page for the user to copy or download. Only the public key and fingerprint are returned.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -238,45 +330,86 @@ if (typeof navigator !== 'undefined' && navigator.modelContext) {
             required: ['name', 'email']
         },
         execute: async (args) => {
-            const {
-                name,
-                email,
-                type = 'ecc',
-                keySize = 4096,
-                passphrase = '',
-                expirationTime = 0
-            } = args;
+            args = args || {};
 
-            // Populate the form fields so the UI reflects the generation
-            optionsName.value = name;
+            // ── Validate/sanitize every argument (never trust agent input) ──
+            const cleanString = (v, maxLen) =>
+                typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, maxLen) : '';
+
+            const name = cleanString(args.name, MCP_MAX_NAME_LEN);
+            const email = cleanString(args.email, MCP_MAX_EMAIL_LEN);
+            if (!name || !email) {
+                return { isError: true, content: [{ type: 'text', text: 'Missing or invalid required arguments: name and email must be non-empty strings.' }] };
+            }
+
+            // Validate the email against the form's input (type="email")
+            // without disturbing whatever the user has typed in it.
+            const prevEmail = optionsEmail.value;
             optionsEmail.value = email;
-            optionsType.value = type;
-            keyAlgorithmChanged(optionsType);
-            optionsKeySize.value = String(keySize);
-            optionsPassphrase.value = passphrase;
-            optionsExpirationTime.value = String(expirationTime);
+            const emailValid = optionsEmail.checkValidity();
+            optionsEmail.value = prevEmail;
+            if (!emailValid) {
+                return { isError: true, content: [{ type: 'text', text: 'Invalid email address supplied.' }] };
+            }
 
-            // Trigger key generation and await the worker result via Promise
-            const result = await new Promise((resolve, reject) => {
-                _mcpPendingResolve = resolve;
-                _mcpPendingReject = reject;
-                generateKeys();
-            });
+            const type = MCP_VALID_TYPES.includes(args.type) ? args.type : 'ecc';
+            const keySize = MCP_VALID_KEY_SIZES.includes(String(args.keySize)) ? String(args.keySize) : '4096';
+            const expirationTime = MCP_VALID_EXPIRATIONS.includes(String(args.expirationTime)) ? String(args.expirationTime) : '0';
+            const passphrase = typeof args.passphrase === 'string' ? args.passphrase.slice(0, MCP_MAX_PASSPHRASE_LEN) : '';
+
+            // ── Serialize generations so concurrent tool calls can't race ──
+            const task = _mcpQueue.then(() =>
+                runMcpGeneration({ name, email, type, keySize, passphrase, expirationTime })
+            );
+            // Keep the queue alive even if this task rejects.
+            _mcpQueue = task.catch(() => {});
+
+            let result;
+            try {
+                result = await task;
+            } catch (err) {
+                return { isError: true, content: [{ type: 'text', text: 'Key generation failed: ' + (err && err.message ? err.message : String(err)) }] };
+            }
+
+            // Read back what was actually generated from the DOM.
+            const armoredPublicKey = publicKeyTextarea.value;
+            let fingerprint = null;
+            try {
+                // OpenPGP.js lives in the Web Worker (not on window), so parse
+                // the key there to obtain its fingerprint.
+                fingerprint = await new Promise((res) => {
+                    const handler = (msg) => {
+                        if (msg.data && msg.data.fingerprint !== undefined) {
+                            worker.removeEventListener("message", handler);
+                            res(msg.data.fingerprint || null);
+                        }
+                    };
+                    worker.addEventListener("message", handler);
+                    worker.postMessage({ getFingerprint: true, armoredKey: armoredPublicKey });
+                    setTimeout(() => {
+                        worker.removeEventListener("message", handler);
+                        res(null);
+                    }, 5000);
+                });
+            } catch (_) { /* non-fatal */ }
+
+            // SECURITY: intentionally do NOT return privateKey or
+            // revocationCertificate to the agent — see notes above.
+            const lines = [
+                'PGP key pair generated successfully (client-side).',
+                'User ID: ' + name + ' <' + email + '>',
+                'Algorithm: ' + type + (type === 'rsa' ? ' (' + keySize + ' bits)' : ' (curve25519)'),
+                fingerprint ? 'Fingerprint: ' + fingerprint : null,
+                '',
+                '=== Public Key ===',
+                armoredPublicKey,
+                '',
+                'NOTE: The private key and revocation certificate were generated but are deliberately not exposed to the AI agent.',
+                'They are shown on the page — ask the user to copy or download them directly.'
+            ].filter(l => l !== null);
 
             return {
-                content: [{
-                    type: 'text',
-                    text: [
-                        '=== Private Key ===',
-                        result.privateKey,
-                        '',
-                        '=== Public Key ===',
-                        result.publicKey,
-                        '',
-                        '=== Revocation Certificate ===',
-                        result.revocationCertificate
-                    ].join('\n')
-                }]
+                content: [{ type: 'text', text: lines.join('\n') }]
             };
         }
     });

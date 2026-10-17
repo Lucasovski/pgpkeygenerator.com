@@ -3,3 +3,10 @@
   to = "/"
   status = 404
   force = true
+
+# Build step refreshes Subresource Integrity (SRI) hashes in index.html so
+# they always match the served bytes, and verifies openpgp.min.js against a
+# pinned sha384 hash (fail the deploy on tampering). See scripts/generate-sri.js.
+[build]
+  command = "npm run build"
+  publish = "."

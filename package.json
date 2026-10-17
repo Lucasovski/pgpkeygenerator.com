@@ -4,6 +4,8 @@
     "serve": "^14.0.0"
   },
   "scripts": {
+    "build": "node scripts/generate-sri.js",
+    "sri:check": "node scripts/generate-sri.js --check",
     "test": "playwright test"
   }
 }
